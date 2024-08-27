@@ -10,4 +10,4 @@ safetensors
 omegaconf
 peft
 gradio
-insightface==0.7.3
+insightface==0.7
