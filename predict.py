@@ -15,7 +15,7 @@ os.environ["HF_HUB_CACHE"] = "models"
 os.environ["HF_HUB_CACHE_OFFLINE"] = "true"
 
 from diffusers.utils import load_image
-from diffusers import EulerDiscreteScheduler
+from diffusers import EulerDiscreteScheduler, T2IAdapter
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
@@ -25,7 +25,9 @@ from huggingface_hub import hf_hub_download
 from transformers import CLIPImageProcessor
 
 from photomaker import PhotoMakerStableDiffusionXLPipeline
+from photomaker import FaceAnalysis2, analyze_faces
 from gradio_demo.style_template import styles
+from gradio_demo.aspect_ratio_template import aspect_ratios
 
 MAX_SEED = np.iinfo(np.int32).max
 STYLE_NAMES = list(styles.keys())
@@ -35,11 +37,11 @@ FEATURE_EXTRACTOR = "./feature-extractor"
 SAFETY_CACHE = "./models/safety-cache"
 SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
 
-BASE_MODEL_URL = "https://weights.replicate.delivery/default/SG161222--RealVisXL_V3.0-11ee564ebf4bd96d90ed5d473cb8e7f2e6450bcf.tar"
-BASE_MODEL_PATH = "models/SG161222/RealVisXL_V3.0"
+BASE_MODEL_URL = "https://weights.replicate.delivery/default/SG161222--RealVisXL_V4.0-49740684ab2d8f4f5dcf6c644df2b33388a8ba85.tar"
+BASE_MODEL_PATH = "models/SG161222/RealVisXL_V4.0"
 
-PHOTOMAKER_URL = "https://weights.replicate.delivery/default/TencentARC--PhotoMaker/photomaker-v1.bin"
-PHOTOMAKER_PATH = "models/photomaker-v1.bin"
+PHOTOMAKER_URL = "https://weights.replicate.delivery/default/TencentARC--PhotoMaker-V2/photomaker-v2.bin"
+PHOTOMAKER_PATH = "models/photomaker-v2.bin"
 
 def download_weights(url, dest, extract=True):
     start = time.time()
@@ -79,9 +81,22 @@ class Predictor(BasePredictor):
         ).to("cuda")
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
 
+
+        torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if self.device == "mps":
+            torch_dtype = torch.float16
+
+        adapter = T2IAdapter.from_pretrained(
+            "TencentARC/t2i-adapter-sketch-sdxl-1.0", torch_dtype=torch_dtype, variant="fp16"
+        ).to(self.device)
+
+        self.face_detector = FaceAnalysis2(providers=['CUDAExecutionProvider'], allowed_modules=['detection', 'recognition'])
+        self.face_detector.prepare(ctx_id=0, det_size=(640, 640))
+
         self.pipe = PhotoMakerStableDiffusionXLPipeline.from_pretrained(
             BASE_MODEL_PATH,
-            torch_dtype=torch.bfloat16,
+            adapter=adapter,
+            torch_dtype=torch_dtype,
             use_safetensors=True,
             variant="fp16",
         ).to(self.device)
@@ -98,6 +113,7 @@ class Predictor(BasePredictor):
             self.pipe.scheduler.config
         )
         self.pipe.fuse_lora()
+        self.pipe.to(self.device)
 
     @torch.inference_mode()
     def predict(
@@ -117,6 +133,7 @@ class Predictor(BasePredictor):
             description="Additional input image (optional)",
             default=None
         ),
+        aspect_ratio_name: str = Input(description="Output image size", choices=list(aspect_ratios.keys()), default=list(aspect_ratios.keys())[0]), 
         prompt: str = Input(
             description="Prompt. Example: 'a photo of a man/woman img'. The phrase 'img' is the trigger word.",
             default="A photo of a person img",
@@ -180,6 +197,10 @@ class Predictor(BasePredictor):
                     f"Cannot use trigger word '{self.pipe.trigger_word}' in negative prompt!"
                 )
 
+        # determine output dimensions by the aspect ratio
+        output_w, output_h = aspect_ratios[aspect_ratio_name]
+        print(f"[Debug] Generate image using aspect ratio [{aspect_ratio_name}] => {output_w} x {output_h}")
+
         # apply the style template
         prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
 
@@ -189,6 +210,20 @@ class Predictor(BasePredictor):
           if maybe_image:
             print(f"Loading image {maybe_image}...")
             input_id_images.append(load_image(str(maybe_image)))
+        
+        id_embed_list = []
+
+        for img in input_id_images:
+            img = np.array(img)
+            img = img[:, :, ::-1]
+            faces = analyze_faces(self.face_detector, img)
+            if len(faces) > 0:
+                id_embed_list.append(torch.from_numpy((faces[0]['embedding'])))
+
+        if len(id_embed_list) == 0:
+            raise ValueError(f"No face detected, please update the input face image(s)")
+
+        id_embeds = torch.stack(id_embed_list)
 
         print(f"Setting seed...")
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -202,6 +237,8 @@ class Predictor(BasePredictor):
         print(f"Start merge step: {start_merge_step}")
         images = self.pipe(
             prompt=prompt,
+            width=output_w,
+            height=output_h,
             input_id_images=input_id_images,
             negative_prompt=negative_prompt,
             num_images_per_prompt=num_outputs, 
@@ -209,6 +246,10 @@ class Predictor(BasePredictor):
             start_merge_step=start_merge_step,
             generator=generator,
             guidance_scale=guidance_scale,
+            id_embeds=id_embeds,
+            image=None,
+            adapter_conditioning_scale=0,
+            adapter_conditioning_factor=0,
         ).images
 
         if not disable_safety_checker:
