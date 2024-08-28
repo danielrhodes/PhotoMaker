@@ -22,7 +22,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 from transformers import CLIPImageProcessor
 
@@ -86,7 +86,7 @@ class Predictor(BasePredictor):
             torch_dtype = torch.bfloat16
 
         photomaker_ckpt = hf_hub_download(repo_id=PHOTOMAKER_HUB_REPO_ID, filename="photomaker-v2.bin", repo_type="model")
-        basemodel_ckpt = hf_hub_download(repo_id=BASE_MODEL_HUB_REPO_ID, repo_type="model")
+        basemodel_ckpt = snapshot_download(repo_id=BASE_MODEL_HUB_REPO_ID, repo_type="model")
 
         # download PhotoMaker checkpoint to cache
         # if we already have the model, this doesn't do anything
