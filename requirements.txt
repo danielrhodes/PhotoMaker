@@ -11,3 +11,7 @@ omegaconf
 peft
 gradio
 insightface==0.7
+pydantic>=1.9,<2
+einops
+onnxruntime
+cog

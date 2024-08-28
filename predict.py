@@ -43,6 +43,9 @@ BASE_MODEL_PATH = "models/SG161222/RealVisXL_V4.0"
 PHOTOMAKER_URL = "https://weights.replicate.delivery/default/TencentARC--PhotoMaker-V2/photomaker-v2.bin"
 PHOTOMAKER_PATH = "models/photomaker-v2.bin"
 
+ADAPTER_URL = "https://weights.replicate.delivery/default/T2I-Adapter-SDXL/t2i-adapter-sketch-sdxl-1.0.tar"
+ADAPTER_PATH = "models/t2i-adapter-sketch-sdxl-1.0"
+
 def download_weights(url, dest, extract=True):
     start = time.time()
     print("downloading url: ", url)
@@ -63,7 +66,7 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
         # download PhotoMaker checkpoint to cache
         # if we already have the model, this doesn't do anything
@@ -73,24 +76,27 @@ class Predictor(BasePredictor):
         if not os.path.exists(BASE_MODEL_PATH):
             download_weights(BASE_MODEL_URL, BASE_MODEL_PATH)
 
+        if not os.path.exists(ADAPTER_PATH):
+            download_weights(ADAPTER_URL, ADAPTER_PATH)
+
         print("Loading safety checker...")
         if not os.path.exists(SAFETY_CACHE):
             download_weights(SAFETY_URL, SAFETY_CACHE)
         self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
             SAFETY_CACHE, torch_dtype=torch.float16
-        ).to("cuda")
+        ).to(self.device)
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
 
 
-        torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         if self.device == "mps":
             torch_dtype = torch.float16
 
         adapter = T2IAdapter.from_pretrained(
-            "TencentARC/t2i-adapter-sketch-sdxl-1.0", torch_dtype=torch_dtype, variant="fp16"
+            ADAPTER_PATH, torch_dtype=torch_dtype, variant="fp16"
         ).to(self.device)
 
-        self.face_detector = FaceAnalysis2(providers=['CUDAExecutionProvider'], allowed_modules=['detection', 'recognition'])
+        self.face_detector = FaceAnalysis2(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'], allowed_modules=['detection', 'recognition'])
         self.face_detector.prepare(ctx_id=0, det_size=(640, 640))
 
         self.pipe = PhotoMakerStableDiffusionXLPipeline.from_pretrained(
@@ -99,7 +105,7 @@ class Predictor(BasePredictor):
             torch_dtype=torch_dtype,
             use_safetensors=True,
             variant="fp16",
-        ).to(self.device)
+        )
 
         self.pipe.load_photomaker_adapter(
             os.path.dirname(PHOTOMAKER_PATH),
@@ -133,7 +139,11 @@ class Predictor(BasePredictor):
             description="Additional input image (optional)",
             default=None
         ),
-        aspect_ratio_name: str = Input(description="Output image size", choices=list(aspect_ratios.keys()), default=list(aspect_ratios.keys())[0]), 
+        aspect_ratio_name: str = Input(
+            description="Output image size",
+            choices=list(aspect_ratios.keys()),
+            default=list(aspect_ratios.keys())[0]
+        ), 
         prompt: str = Input(
             description="Prompt. Example: 'a photo of a man/woman img'. The phrase 'img' is the trigger word.",
             default="A photo of a person img",
