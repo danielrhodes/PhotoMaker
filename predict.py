@@ -10,9 +10,11 @@ import os
 import shutil
 import subprocess
 import time
+import sys
 
 os.environ["HF_HUB_CACHE"] = "models"
 os.environ["HF_HUB_CACHE_OFFLINE"] = "true"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 from diffusers.utils import load_image
 from diffusers import EulerDiscreteScheduler, T2IAdapter
@@ -37,11 +39,14 @@ FEATURE_EXTRACTOR = "./feature-extractor"
 SAFETY_CACHE = "./models/safety-cache"
 SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
 
+BASE_MODEL_HUB_REPO_ID = "SG161222/RealVisXL_V4.0"
 BASE_MODEL_URL = "https://weights.replicate.delivery/default/SG161222--RealVisXL_V4.0-49740684ab2d8f4f5dcf6c644df2b33388a8ba85.tar"
 BASE_MODEL_PATH = "models/SG161222/RealVisXL_V4.0"
 
-PHOTOMAKER_URL = "https://weights.replicate.delivery/default/TencentARC--PhotoMaker-V2/photomaker-v2.bin"
-PHOTOMAKER_PATH = "models/photomaker-v2.bin"
+PHOTOMAKER_BIN_PATH = "photomaker-v2.bin"
+PHOTOMAKER_URL = f"https://weights.replicate.delivery/default/TencentARC--PhotoMaker-V2/{PHOTOMAKER_BIN_PATH}"
+PHOTOMAKER_PATH = "models/{PHOTOMAKER_BIN_PATH}"
+PHOTOMAKER_HUB_REPO_ID = "TencentARC/PhotoMaker-V2"
 
 ADAPTER_URL = "https://weights.replicate.delivery/default/T2I-Adapter-SDXL/t2i-adapter-sketch-sdxl-1.0.tar"
 ADAPTER_PATH = "models/t2i-adapter-sketch-sdxl-1.0"
@@ -66,51 +71,62 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
 
-        self.device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif sys.platform == "darwin" and torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        except:
+            self.device = "cpu"
+
+        torch_dtype = torch.float16
+        if self.device == "cuda" and torch.cuda.is_bf16_supported():
+            torch_dtype = torch.bfloat16
+
+        photomaker_ckpt = hf_hub_download(repo_id=PHOTOMAKER_HUB_REPO_ID, filename="photomaker-v2.bin", repo_type="model")
+        basemodel_ckpt = hf_hub_download(repo_id=BASE_MODEL_HUB_REPO_ID, repo_type="model")
 
         # download PhotoMaker checkpoint to cache
         # if we already have the model, this doesn't do anything
-        if not os.path.exists(PHOTOMAKER_PATH):
-            download_weights(PHOTOMAKER_URL, PHOTOMAKER_PATH, extract=False)
+        # if not os.path.exists(PHOTOMAKER_PATH):
+        #     download_weights(PHOTOMAKER_URL, PHOTOMAKER_PATH, extract=False)
 
-        if not os.path.exists(BASE_MODEL_PATH):
-            download_weights(BASE_MODEL_URL, BASE_MODEL_PATH)
+        # if not os.path.exists(BASE_MODEL_PATH):
+        #     download_weights(BASE_MODEL_URL, BASE_MODEL_PATH)
 
-        if not os.path.exists(ADAPTER_PATH):
-            download_weights(ADAPTER_URL, ADAPTER_PATH)
+        # if not os.path.exists(ADAPTER_PATH):
+        #     download_weights(ADAPTER_URL, ADAPTER_PATH)
 
         print("Loading safety checker...")
         if not os.path.exists(SAFETY_CACHE):
             download_weights(SAFETY_URL, SAFETY_CACHE)
+
         self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_CACHE, torch_dtype=torch.float16
+            SAFETY_CACHE, torch_dtype=torch_dtype
         ).to(self.device)
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
-
-
-        torch_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-        if self.device == "mps":
-            torch_dtype = torch.float16
-
-        adapter = T2IAdapter.from_pretrained(
-            ADAPTER_PATH, torch_dtype=torch_dtype, variant="fp16"
-        ).to(self.device)
 
         self.face_detector = FaceAnalysis2(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'], allowed_modules=['detection', 'recognition'])
         self.face_detector.prepare(ctx_id=0, det_size=(640, 640))
 
+        # adapter = T2IAdapter.from_pretrained(
+        #     ADAPTER_PATH, torch_dtype=torch_dtype, variant="fp16"
+        # ).to(self.device)
+
         self.pipe = PhotoMakerStableDiffusionXLPipeline.from_pretrained(
-            BASE_MODEL_PATH,
-            adapter=adapter,
+            os.path.basename(basemodel_ckpt),
+            # adapter=adapter,
             torch_dtype=torch_dtype,
             use_safetensors=True,
             variant="fp16",
         )
 
         self.pipe.load_photomaker_adapter(
-            os.path.dirname(PHOTOMAKER_PATH),
+            os.path.dirname(photomaker_ckpt),
             subfolder="",
-            weight_name=os.path.basename(PHOTOMAKER_PATH),
+            weight_name=os.path.basename(photomaker_ckpt),
             trigger_word="img",
         )
         self.pipe.id_encoder.to(self.device)
@@ -280,7 +296,7 @@ class Predictor(BasePredictor):
 
     def run_safety_checker(self, image):
         safety_checker_input = self.feature_extractor(image, return_tensors="pt").to(
-            "cuda"
+            self.device
         )
         np_image = [np.array(val) for val in image]
         image, has_nsfw_concept = self.safety_checker(
